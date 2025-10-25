@@ -90,7 +90,9 @@ make run
 Terminal 3 (for Client):
 ```bash
 curl http://localhost:8080/index.html   # for seeing Cache MISS
-curl http://localhost:8080/index.html   # for seeing Cache HIT
+curl http://localhost:8080/index.html   # for seeing Cache HIT 
+
+or open this link on your browser in the incognito-mode as the browser ususally caches your requests locally so next time even on a hit it might so happen that it doesn't send the response back to the proxy!!
 ```
 
 ## Features
