@@ -216,7 +216,7 @@ void *client_handler(void *arg)
         return NULL;
     }
     buffer[r] = '\0';
-    printf("Thread %lu handling the request:\n", pthread_self());
+    printf("{Thread: %lu} handling the request:\n", pthread_self());
 
     // checking if it's a get request or any other
     char method[16], path[1024];
