@@ -16,7 +16,7 @@ The system consists of:
 ### 1. Start the Origin Server
 In a new terminal:
 ```bash
-cd ~/PROXY_PROJECT/proxy_origin
+cd ~/proxy_project/proxy_origin
 python3 -m http.server 8000
 ```
 This starts a simple HTTP server that serves files from the `proxy_origin` directory on port `8000`.
@@ -24,14 +24,26 @@ This starts a simple HTTP server that serves files from the `proxy_origin` direc
 ### 2. Building and Running the Proxy Server
 In another terminal:
 ```bash
-cd ~/proxy_project
-make
-./proxy
+cd ~/proxy_project 
+gcc -std=gnu11 -Wall -O2 -pthread proxy.c -o proxy && ./proxy
 ```
 The proxy server will start listening on port `8080`.
 
-## Sending Client Requests
+## Alternate way:
+either you can do the above stuff or you can simply run the makefile's make commands as follows:
+1. open the proxy_project directory then run these-> 
+```make clean
+   make
+   make run
+``` 
+2. Now open another terminal and run this for origin server->
+```
+   make origin
+```
 
+
+## Sending Client Requests
+Open a new terminal for client.
 You can use either `curl` or a web browser as a client.
 
 ### Using curl:
@@ -64,15 +76,15 @@ The system supports concurrent clients and maintains cache consistency using an 
 ## Example Execution Sequence
 Terminal 1 (for Origin):
 ```bash
-cd ~/proxy_origin
-python3 -m http.server 8000
+cd ~/proxy_project
+make origin
 ```
 
 Terminal 2 (for Proxy):
 ```bash
 cd ~/proxy_project
 make
-./proxy
+make run
 ```
 
 Terminal 3 (for Client):
@@ -81,27 +93,21 @@ curl http://localhost:8080/index.html   # for seeing Cache MISS
 curl http://localhost:8080/index.html   # for seeing Cache HIT
 ```
 
----
-
 ## Features
 - Multithreaded proxy implementation using POSIX threads
 - Thread-safe in-memory cache with LRU eviction
 - Proper handling of partial writes and `EINTR`
 - Graceful response to unsupported HTTP methods (`501 Not Implemented`)
-- Easy testing using curl or browser clients
-- Configurable constants:
-  - `PROXY_PORT = 8080`
-  - `ORIGIN_PORT = 8000`
-  - `CACHE_CAPACITY = 5`
+- Testing it using curl or browser clients
 
 ## Example Proxy Output
 ```
 Proxy listening on port 8080
-[Thread 140735620088640] Method=GET Path=/index.html
-[Thread 140735620088640] Cache MISS for /index.html
-[Thread 140735620088640] Cached /index.html (len=267)
-[Thread 140735620088648] Method=GET Path=/index.html
-[Thread 140735620088648] Cache HIT for /index.html
+{Thread 140735620088640} Method=GET Path=/index.html
+{Thread 140735620088640} Cache MISS for /index.html
+{Thread 140735620088640} Cached /index.html (len=267)
+{Thread 140735620088648} Method=GET Path=/index.html
+{Thread 140735620088648} Cache HIT for /index.html
 ```
 
 ## Repository Structure
@@ -111,5 +117,5 @@ proxy_project/
 ├── proxy.c          # Proxy server implementation
 ├── Makefile         # Build configuration
 ├── README.md        # Project documentation
-└── origin_server/   # Directory containing files served by the origin
+└── proxy_origin/   # Directory containing files served by the origin
 ```
