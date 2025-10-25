@@ -17,5 +17,5 @@ make
 ## To send requests as a client
 
 1.Open multiple terminals
-2.On each terminal you can send requests of the the name of files you want to retrieve in this format: http://localhost:8080/<FILE-NAME> 
+2.On each terminal you can send requests of the the name of files you want to retrieve in this format: curl http://localhost:8080/<FILE-NAME> 
 3. You can check on the proxy side terminal that when the file was not present in the cache then it shows 'Cache MISS' else 'Cache HIT'
