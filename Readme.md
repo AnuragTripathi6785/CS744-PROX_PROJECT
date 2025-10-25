@@ -16,7 +16,7 @@ The system consists of:
 ### 1. Start the Origin Server
 In a new terminal:
 ```bash
-cd ~/proxy_origin
+cd ~/PROXY_PROJECT/proxy_origin
 python3 -m http.server 8000
 ```
 This starts a simple HTTP server that serves files from the `proxy_origin` directory on port `8000`.
