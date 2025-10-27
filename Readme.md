@@ -119,5 +119,67 @@ proxy_project/
 ├── proxy.c          # Proxy server implementation
 ├── Makefile         # Build configuration
 ├── README.md        # Project documentation
-└── proxy_origin/   # Directory containing files served by the origin
+├── lg_urls.lua      # Lua script for random and skewed request generation
+└── proxy_origin/<all the files from origin>    # Directory containing files served by the origin
 ```
+
+## LOAD GENERATION:
+`wrk` was used to test the proxy server under concurrent load.  
+The Lua script `lg_urls.lua` generates HTTP GET requests for the files in the origin directory (`file1.html` to `file23.html`).  
+The same script can simulate both uniform random access and a 70–30 skew (where 70% of the requests go to a few “hot” files).
+
+The main metrics measured are:
+- Requests per second (throughput)
+- Average latency
+- Cache hit/miss counts
+- Hit ratio
+
+
+### Installing wrk
+If not installed already:
+brew install wrk
+
+
+### Running Load Tests
+From the proxy project directory:
+wrk -t4 -c50 -d20s -s lg_urls.lua http://localhost:8080 > wrk_lua_mix.txt
+
+Here:
+- `-t4` → 4 threads generating load  
+- `-c50` → 50 concurrent connections  
+- `-d20s` → duration of 20 seconds  
+- `-s lg_urls.lua` → Lua script for random request generation
+
+
+### Viewing Results
+After the benchmark completes:
+cat wrk_lua_mix.txt
+
+Example output:-
+
+Running 30s test @ http://localhost:8080
+  4 threads and 100 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    11.77ms   70.45ms   1.36s    96.25%
+    Req/Sec     5.91k     3.96k   17.62k    60.45%
+  160642 requests in 30.10s, 32.68MB read
+  Socket errors: connect 100, read 12, write 0, timeout 48
+  Non-2xx or 3xx responses: 2621
+Requests/sec:   5336.07
+Transfer/sec:      1.09MB
+
+
+### Checking Cache Statistics
+While the proxy is running, cache stats can be viewed at:
+curl http://localhost:8080/__figs
+
+Example output:
+Hits:~: 14320  
+Misses:~: 4820  
+Current Cache Count:~: 10  
+Hit Ratio:~: 74.81%  
+
+## Optimizations that I tried:-
+1. Initially I used mutex everywhere, then I switched it to rwlock this optimised my perfromance from:
+<A> to <B> 
+2. 

@@ -6,12 +6,13 @@
 #include <arpa/inet.h>
 #include <stdint.h> //for making the cache
 #include <errno.h>
+#include <stdatomic.h> //for incrementing the variable for cache hit/miss atomically less overhead
 
 // defining the port numbers and other macros
 #define PROXY_PORT 8080
 #define ORIGIN_PORT 8000
 #define BUFFER_SIZE 8192
-#define CACHE_CAPACITY 5
+#define CACHE_CAPACITY 15
 #define HASH_SIZE 1031 // it's a prime number becaue we want to do uniform hashing
 
 // structure of the cache:
@@ -30,9 +31,12 @@ static Cacheline *lru_head = NULL;
 static Cacheline *lru_tail = NULL;
 static int current_cache_count;
 static Cacheline *hash_table[HASH_SIZE] = {0};
-static pthread_mutex_t cache_lock = PTHREAD_MUTEX_INITIALIZER;
+// static pthread_mutex_t cache_lock = PTHREAD_MUTEX_INITIALIZER; using this slowed down the performance instead I used this:
+static pthread_rwlock_t cache_rwlock = PTHREAD_RWLOCK_INITIALIZER;
+static atomic_ulong cache_hit = 0;
+static atomic_ulong cache_miss = 0;
 
-// making the DJB2 hash algo to convert path/url into a an integer to be hashed into bucket
+// making the use of DJB2 hash algo to convert path/url into a an integer to be hashed into bucket
 static unsigned long hash_path(const char *str)
 {
     unsigned long hash = 5381;
@@ -118,24 +122,24 @@ static Cacheline *cache_look_up(const char *path)
 
 static char *cache_read(const char *path, size_t *data_len)
 {
-    pthread_mutex_lock(&cache_lock);
+    pthread_rwlock_rdlock(&cache_rwlock);
     Cacheline *node = cache_look_up(path);
     if (!node)
     {
-        pthread_mutex_unlock(&cache_lock);
+        pthread_rwlock_unlock(&cache_rwlock);
         return NULL;
     }
     remove_from_list(node);
     insert_into_list(node);
     *data_len = node->data_len;
     char *data = node->data;
-    pthread_mutex_unlock(&cache_lock);
+    pthread_rwlock_unlock(&cache_rwlock);
     return data;
 }
 
 static int cache_write(const char *path, const char *data, size_t data_len)
 {
-    pthread_mutex_lock(&cache_lock);
+    pthread_rwlock_wrlock(&cache_rwlock);
     Cacheline *existing = cache_look_up(path);
     if (existing)
     { /*replace the existing data*/
@@ -143,20 +147,22 @@ static int cache_write(const char *path, const char *data, size_t data_len)
         existing->data = malloc(data_len);
         if (!existing->data) // memory full
         {
-            pthread_mutex_unlock(&cache_lock);
+            pthread_mutex_unlock(&cache_rwlock);
             return -1;
         }
         memcpy(existing->data, data, data_len);
         existing->data_len = data_len;
         remove_from_list(existing);
         insert_into_list(existing);
+        pthread_rwlock_unlock(&cache_rwlock);
+        return 0;
     }
     else
     { /*create a new node*/
         Cacheline *new_node = malloc(sizeof(Cacheline));
         if (!new_node)
         {
-            pthread_mutex_unlock(&cache_lock);
+            pthread_rwlock_unlock(&cache_rwlock);
             return -1;
         }
         new_node->data = malloc(data_len);
@@ -166,7 +172,7 @@ static int cache_write(const char *path, const char *data, size_t data_len)
             free(new_node->data);
             free(new_node->path);
             free(new_node);
-            pthread_mutex_unlock(&cache_lock);
+            pthread_rwlock_unlock(&cache_rwlock);
             return -1;
         }
         memcpy(new_node->data, data, data_len);
@@ -180,7 +186,7 @@ static int cache_write(const char *path, const char *data, size_t data_len)
         current_cache_count++;
         evict();
     }
-    pthread_mutex_unlock(&cache_lock);
+    pthread_rwlock_unlock(&cache_rwlock);
     return 0;
 }
 
@@ -222,6 +228,26 @@ void *client_handler(void *arg)
     char method[16], path[1024];
     sscanf(buffer, "%15s %1023s", method, path);
     printf("Method=%s Path=%s\n", method, path);
+
+    // if client wants to retireve some info about the performance figures(hit ratio):
+    if (strcmp(path, "/__figs") == 0)
+    {
+        char c[256];
+        const char *http_header = "HTTP/1.1 200 OK\r\n\r\n";
+        unsigned long hits = atomic_load(&cache_hit);
+        unsigned long misses = atomic_load(&cache_miss);
+        unsigned long total = hits + misses;
+        double ratio = 0.0;
+        if (total > 0)
+            ratio = ((double)hits / (double)total) * 100.0;
+        int n = snprintf(c, sizeof(c), "Hits:~: %lu\nMisses:~: %lu\nCurrent Cache Count:~: %lu\nHit Ratio:~: %.3f\n", atomic_load(&cache_hit), atomic_load(&cache_miss), current_cache_count, ratio);
+        write_complete(client_fd, http_header, strlen(http_header));
+        write_complete(client_fd, c, n);
+        close(client_fd);
+        pthread_exit(NULL);
+    }
+
+    // checking if the method was GET or not
     if (strcmp(method, "GET") != 0)
     {
         const char *error_msg = "HTTP/1.1 501 Not Implemented\r\nContent-Length: 22\r\n\r\nOnly GET supported for now!";
@@ -235,6 +261,7 @@ void *client_handler(void *arg)
     char *cached_data = cache_read(path, &cached_len);
     if (cached_data)
     {
+        atomic_fetch_add(&cache_hit, 1);
         printf("Cache HIT!\n");
         write_complete(client_fd, cached_data, cached_len);
         close(client_fd);
@@ -242,6 +269,7 @@ void *client_handler(void *arg)
     }
 
     // on miss
+    atomic_fetch_add(&cache_miss, 1);
     printf("Cache MISS for %s, fetching the data from origin server...\n", path);
 
     // establishing connection with the origin server on the cache miss
