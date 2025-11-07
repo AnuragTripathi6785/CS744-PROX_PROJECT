@@ -1,13 +1,3 @@
-// proxy_server.c
-// Final stable proxy / KV server with LRU cache, PostgreSQL pool,
-// worker thread pool, and graceful shutdown (SIGINT/SIGTERM).
-// Compile with: gcc -std=gnu11 -Wall -O2 -pthread proxy_server.c -o proxy_server \
-//   -I/opt/homebrew/opt/libpq/include -L/opt/homebrew/opt/libpq/lib -lpq
-//
-// Notes:
-// - Make sure PostgreSQL is running and the DB/role in DB_CONNINFO exists.
-// - If bind fails with "Address already in use", kill the old server (commands below).
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -70,8 +60,6 @@ static task_queue_t queue = {
 static volatile sig_atomic_t stop_server = 0;
 static int shutdown_pipe[2] = {-1, -1}; // pipe to wake select()
 
-/* ---------- helpers ---------- */
-
 /* signal handler - sets flag and writes to pipe to wake select() */
 static void handle_signal(int sig)
 {
@@ -103,7 +91,7 @@ static ssize_t write_complete(int fd, const char *buf, size_t len)
     return (ssize_t)sent;
 }
 
-/* ---------- DB pool/init/ops ---------- */
+/*  DB pool/init/ops  */
 
 static int init_db_pool(void)
 {
@@ -236,7 +224,7 @@ static int db_delete_kv(const char *key)
     return 0;
 }
 
-/* ---------- cache helpers ---------- */
+/*  cache helpers  */
 
 static unsigned long hash_key(const char *s)
 {
@@ -415,7 +403,7 @@ static int cache_delete(const char *key)
     return 0;
 }
 
-/* ---------- task queue ops ---------- */
+/*  task queue ops  */
 static void enqueue_task(int fd)
 {
     pthread_mutex_lock(&queue.lock);
@@ -452,7 +440,7 @@ static int dequeue_task(void)
     return fd;
 }
 
-/* ---------- client handler ---------- */
+/*  client handler  */
 static void handle_client_fd(int client_fd)
 {
     char buf[BUFFER_SIZE];
