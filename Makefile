@@ -1,6 +1,5 @@
-# ========================================
-# Makefile for HTTP-based Key-Value Proxy Server
-# ========================================
+
+# Makefile for HTTP-based Key-Value Proxy Server:-  
 
 # Compiler and flags
 CC = gcc
