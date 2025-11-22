@@ -6,6 +6,12 @@ This project implements a high-performance, multithreaded HTTP-based key-value s
 
 The implementation demonstrates a complete two-tier architecture where the HTTP server acts as the frontend with caching capabilities, and PostgreSQL provides the persistent storage layer. The project was developed in two phases, with Phase 1 focusing on core functionality and Phase 2 adding performance evaluation capabilities.
 
+## Phase 2 quick start (how I run it)
+- I follow `PHASE2_REPORT_GUIDE.md` for the demo/report checklist (two distinct bottlenecks, 7 load levels, 5-minute runs, graphs).
+- Build/run server: `make clean && make && make run` (I keep it on its own CPU/terminal).
+- Full sweep + graphs: `make experiments && make graphs` (outputs to `experiment_results/`).
+- Single-point repro: `make hot THREADS=4 CONNECTIONS=100 DURATION=300s` or `make cold ...`.
+
 ---
 
 ## System Architecture
@@ -25,7 +31,7 @@ The implementation demonstrates a complete two-tier architecture where the HTTP 
 │  └────────────────────────────────┘  │
 │  ┌────────────────────────────────┐  │
 │  │   LRU Cache (In-Memory)        │  │
-│  │   Capacity: 15 entries         │  │
+│  │   Capacity: 200 entries        │  │
 │  └────────────────────────────────┘  │
 │  ┌────────────────────────────────┐  │
 │  │   DB Connection Pool (10 conn) │  │
@@ -64,7 +70,7 @@ The first phase focused on building a functional multithreaded HTTP key-value se
 **Caching:**
 - LRU (Least Recently Used) eviction policy
 - Thread-safe implementation using RWLocks
-- Cache capacity of 15 entries
+- Cache capacity of 200 entries
 - Write-through caching strategy
 
 **Concurrency:**
@@ -164,7 +170,7 @@ Database initialized successfully
    Connection pool size: 10
 Server started successfully
    Listening on port: 8080
-   Cache capacity: 15 entries
+   Cache capacity: 200 entries
    Database: PostgreSQL (connected)
 
 Access statistics at: http://localhost:8080/__stats

@@ -13,7 +13,7 @@
 
 #define SERVER_PORT 8080
 #define BUFFER_SIZE 8192
-#define CACHE_CAPACITY 15
+#define CACHE_CAPACITY 200
 #define HASH_SIZE 1031
 #define MAX_THREADS 8
 #define MAX_QUEUE 256
@@ -32,13 +32,15 @@ static Cacheline *lru_head = NULL, *lru_tail = NULL;
 static Cacheline *hash_table[HASH_SIZE] = {0};
 static int current_cache_count = 0;
 static pthread_rwlock_t cache_rwlock = PTHREAD_RWLOCK_INITIALIZER;
-
+static int worker_count = MAX_THREADS;
 /* statistics */
 static atomic_ulong cache_hit = 0, cache_miss = 0;
 static atomic_ulong db_reads = 0, db_writes = 0;
 static atomic_ulong total_gets = 0, total_puts = 0, total_deletes = 0;
 
 /* DB pool */
+// perthread db connection
+static __thread PGconn *thread_conn = NULL;
 static PGconn *db_conn_pool[10];
 static int db_pool_size = 10;
 static pthread_mutex_t db_pool_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -134,35 +136,26 @@ static PGconn *get_db_connection(void)
 /* write (binary) value using decode('..','escape') method after PQescapeStringConn */
 static int db_write_kv(const char *key, const char *value, size_t value_len)
 {
-    // Normalize key to remove leading slash if present
-    const char *normalized_key = key;
-    if (key[0] == '/')
-        normalized_key = key + 1;
-    PGconn *conn = get_db_connection();
+    PGconn *conn = thread_conn;
     if (!conn || PQstatus(conn) != CONNECTION_OK)
     {
         fprintf(stderr, "DB write: invalid connection\n");
         return -1;
     }
-    size_t esc_len = value_len * 2 + 1;
-    char *escaped = malloc(esc_len);
-    if (!escaped)
-        return -1;
-    PQescapeStringConn(conn, escaped, value, (int)value_len, NULL);
-
-    char query[8192];
-    int n = snprintf(query, sizeof(query),
-                     "INSERT INTO kv_store (key, value, updated_at) "
-                     "VALUES ('%s', decode('%s','escape'), CURRENT_TIMESTAMP) "
-                     "ON CONFLICT (key) DO UPDATE SET value = decode('%s','escape'), updated_at = CURRENT_TIMESTAMP;",
-                     key, escaped, escaped);
-    free(escaped);
-    if (n < 0 || n >= (int)sizeof(query))
-    {
-        fprintf(stderr, "DB write: query too long\n");
-        return -1;
-    }
-    PGresult *res = PQexec(conn, query);
+    const char *paramValues[2] = {key, value};
+    int paramLengths[2] = {(int)strlen(key), (int)value_len};
+    int paramFormats[2] = {0, 1}; /* key text, value binary */
+    PGresult *res = PQexecParams(
+        conn,
+        "INSERT INTO kv_store (key, value, updated_at) "
+        "VALUES ($1, $2::bytea, CURRENT_TIMESTAMP) "
+        "ON CONFLICT (key) DO UPDATE SET value = $2::bytea, updated_at = CURRENT_TIMESTAMP;",
+        2,
+        NULL,
+        paramValues,
+        paramLengths,
+        paramFormats,
+        0);
     if (PQresultStatus(res) != PGRES_COMMAND_OK)
     {
         fprintf(stderr, "DB write failed for key %s: %s\n", key, PQerrorMessage(conn));
@@ -176,11 +169,7 @@ static int db_write_kv(const char *key, const char *value, size_t value_len)
 
 static char *db_read_kv(const char *key, size_t *out_len)
 {
-    // Normalize key to remove leading slash if present
-    const char *normalized_key = key;
-    if (key[0] == '/')
-        normalized_key = key + 1;
-    PGconn *conn = get_db_connection();
+    PGconn *conn = thread_conn;
     if (!conn || PQstatus(conn) != CONNECTION_OK)
         return NULL;
     const char *params[1] = {key};
@@ -211,11 +200,7 @@ static char *db_read_kv(const char *key, size_t *out_len)
 
 static int db_delete_kv(const char *key)
 {
-    // Normalize key to remove leading slash if present
-    const char *normalized_key = key;
-    if (key[0] == '/')
-        normalized_key = key + 1;
-    PGconn *conn = get_db_connection();
+    PGconn *conn = thread_conn;
     if (!conn)
         return -1;
     const char *params[1] = {key};
@@ -441,137 +426,287 @@ static int dequeue_task(void)
 }
 
 /*  client handler  */
+/* Robust client handler: reads headers fully, parses Content-Length, reads body reliably. */
 static void handle_client_fd(int client_fd)
 {
-    char buf[BUFFER_SIZE];
-    ssize_t r = read(client_fd, buf, sizeof(buf) - 1);
-    if (r <= 0)
+    if (!thread_conn)
+    {
+        thread_conn = PQconnectdb(DB_CONNINFO);
+        if (PQstatus(thread_conn) != CONNECTION_OK)
+        {
+            fprintf(stderr, "Thread DB connection failed: %s\n", PQerrorMessage(thread_conn));
+            close(client_fd);
+            return;
+        }
+    }
+
+    /* Read headers (loop until "\r\n\r\n") into a dynamically grown buffer */
+    size_t hdr_cap = 8192;
+    size_t hdr_len = 0;
+    char *hdr = malloc(hdr_cap);
+    if (!hdr)
     {
         close(client_fd);
         return;
     }
-    buf[r] = '\0';
-    char method[16], path[1024];
-    sscanf(buf, "%15s %1023s", method, path);
 
+    ssize_t n;
+    int header_complete = 0;
+    while (!header_complete)
+    {
+        if (hdr_len + 4096 > hdr_cap)
+        {
+            size_t newcap = hdr_cap * 2;
+            char *tmp = realloc(hdr, newcap);
+            if (!tmp)
+            {
+                free(hdr);
+                close(client_fd);
+                return;
+            }
+            hdr = tmp;
+            hdr_cap = newcap;
+        }
+        n = read(client_fd, hdr + hdr_len, 4096);
+        if (n < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            free(hdr);
+            close(client_fd);
+            return;
+        }
+        if (n == 0)
+        {
+            /* client closed connection before sending anything */
+            free(hdr);
+            close(client_fd);
+            return;
+        }
+        hdr_len += (size_t)n;
+        hdr[hdr_len] = '\0';
+        if (hdr_len >= 4)
+        {
+            if (strstr(hdr, "\r\n\r\n") != NULL)
+                header_complete = 1;
+        }
+        /* safety: cap headers at 64KB */
+        if (hdr_len > 65536)
+        {
+            free(hdr);
+            close(client_fd);
+            return;
+        }
+    }
+
+    /* parse method and path */
+    char method[16] = {0}, path[1024] = {0};
+    if (sscanf(hdr, "%15s %1023s", method, path) != 2)
+    {
+        free(hdr);
+        close(client_fd);
+        return;
+    }
+
+    /* Stats endpoint first (no body needed) */
     if (strcmp(path, "/__stats") == 0)
     {
         unsigned long h = atomic_load(&cache_hit), m = atomic_load(&cache_miss);
         unsigned long total = h + m;
         double ratio = (total > 0) ? ((double)h / total * 100.0) : 0.0;
         char resp[512];
-        int n = snprintf(resp, sizeof(resp),
-                         "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n"
-                         "Cache Hits: %lu\nCache Misses: %lu\nCache Hit Ratio: %.2f%%\nDB Reads: %lu\nDB Writes: %lu\n",
-                         h, m, ratio, atomic_load(&db_reads), atomic_load(&db_writes));
-        write_complete(client_fd, resp, (size_t)n);
+        int len = snprintf(resp, sizeof(resp),
+                           "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\n\r\n"
+                           "Cache Hits: %lu\nCache Misses: %lu\nCache Hit Ratio: %.2f%%\nDB Reads: %lu\nDB Writes: %lu\n",
+                           (size_t)((size_t)snprintf(NULL, 0,
+                                                     "Cache Hits: %lu\nCache Misses: %lu\nCache Hit Ratio: %.2f%%\nDB Reads: %lu\nDB Writes: %lu\n",
+                                                     h, m, ratio, atomic_load(&db_reads), atomic_load(&db_writes))),
+                           h, m, ratio, atomic_load(&db_reads), atomic_load(&db_writes));
+        write_complete(client_fd, resp, (size_t)len);
+        free(hdr);
         close(client_fd);
         return;
     }
 
-    if (strcmp(method, "PUT") == 0)
+    /* Find header end */
+    char *hdr_end = strstr(hdr, "\r\n\r\n");
+    size_t header_bytes = (hdr_end ? (size_t)(hdr_end + 4 - hdr) : hdr_len);
+    /* Parse Content-Length (case-insensitive) */
+    int content_length = 0;
+    char *p = hdr;
+    while (p && (p < hdr + header_bytes))
+    {
+        /* find end of this header line */
+        char *line_end = strstr(p, "\r\n");
+        if (!line_end)
+            break;
+        size_t linelen = (size_t)(line_end - p);
+        if (linelen > 15) /* quick filter */
+        {
+            if (strncasecmp(p, "Content-Length:", 15) == 0)
+            {
+                /* skip past colon */
+                char *val = p + 15;
+                while (*val == ' ' || *val == '\t')
+                    val++;
+                content_length = atoi(val);
+                break;
+            }
+        }
+        p = line_end + 2;
+    }
+
+    /* Handle methods */
+    if (strcasecmp(method, "PUT") == 0)
     {
         atomic_fetch_add(&total_puts, 1);
-        char *cl = strstr(buf, "Content-Length:");
-        if (!cl)
+
+        /* Require Content-Length for PUT */
+        if (content_length <= 0)
         {
+            const char *resp = "HTTP/1.1 411 Length Required\r\nContent-Length: 0\r\n\r\n";
+            write_complete(client_fd, resp, strlen(resp));
+            free(hdr);
             close(client_fd);
             return;
         }
-        int content_length = 0;
-        sscanf(cl, "Content-Length: %d", &content_length);
-        char *body = strstr(buf, "\r\n\r\n");
-        if (!body)
+
+        /* Allocate buffer for body and copy any body bytes already read after header */
+        char *body_buf = malloc((size_t)content_length + 1);
+        if (!body_buf)
         {
+            free(hdr);
             close(client_fd);
             return;
         }
-        body += 4;
-        int already = (int)(r - (body - buf));
-        char *data = malloc(content_length);
-        if (!data)
+
+        size_t already = 0;
+        if (hdr_end)
         {
-            close(client_fd);
-            return;
+            /* bytes after header_end in hdr buffer are part of the body */
+            size_t tail_bytes = hdr_len - header_bytes;
+            if (tail_bytes > 0)
+            {
+                size_t tocopy = tail_bytes;
+                if (tocopy > (size_t)content_length)
+                    tocopy = (size_t)content_length;
+                memcpy(body_buf, hdr + header_bytes, tocopy);
+                already = tocopy;
+            }
         }
-        memcpy(data, body, (size_t)already);
-        int total = already;
-        while (total < content_length)
+
+        /* read remaining bytes */
+        size_t total = already;
+        while (total < (size_t)content_length)
         {
-            ssize_t n = read(client_fd, data + total, content_length - total);
-            if (n <= 0)
+            ssize_t r = read(client_fd, body_buf + total, (size_t)content_length - total);
+            if (r < 0)
+            {
+                if (errno == EINTR)
+                    continue;
                 break;
-            total += (int)n;
+            }
+            if (r == 0)
+                break; /* client closed early */
+            total += (size_t)r;
         }
-        if (db_write_kv(path, data, (size_t)content_length) == 0)
+
+        /* if we didn't get full body, fail gracefully */
+        if (total < (size_t)content_length)
         {
-            cache_write(path, data, (size_t)content_length);
-            const char *ok = "HTTP/1.1 200 OK\r\n\r\nOK";
+            const char *resp = "HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+            write_complete(client_fd, resp, strlen(resp));
+            free(body_buf);
+            free(hdr);
+            close(client_fd);
+            return;
+        }
+
+        /* Null-terminate for safety in case code expects strings (values may be binary) */
+        body_buf[content_length] = '\0';
+
+        /* Write to DB and update cache */
+        if (db_write_kv(path, body_buf, (size_t)content_length) == 0)
+        {
+            cache_write(path, body_buf, (size_t)content_length);
+            const char *ok = "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nOK";
             write_complete(client_fd, ok, strlen(ok));
         }
         else
         {
-            const char *err = "HTTP/1.1 500 Internal Server Error\r\n\r\n";
+            const char *err = "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
             write_complete(client_fd, err, strlen(err));
         }
-        free(data);
+
+        free(body_buf);
+        free(hdr);
         close(client_fd);
         return;
     }
-
-    if (strcmp(method, "GET") == 0)
+    else if (strcasecmp(method, "GET") == 0)
     {
         atomic_fetch_add(&total_gets, 1);
+
         size_t len = 0;
         char *val = cache_read(path, &len);
         if (val)
         {
             atomic_fetch_add(&cache_hit, 1);
-            char header[128];
-            int h = snprintf(header, sizeof(header), "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\n\r\n", len);
+            char header[160];
+            int h = snprintf(header, sizeof(header), "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: %zu\r\n\r\n", len);
             write_complete(client_fd, header, (size_t)h);
             write_complete(client_fd, val, len);
+            free(hdr);
             close(client_fd);
             return;
         }
+
         atomic_fetch_add(&cache_miss, 1);
         size_t db_len = 0;
         char *dbv = db_read_kv(path, &db_len);
         if (dbv)
         {
             cache_write(path, dbv, db_len);
-            char header[128];
-            int h = snprintf(header, sizeof(header), "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\n\r\n", db_len);
+            char header[160];
+            int h = snprintf(header, sizeof(header), "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: %zu\r\n\r\n", db_len);
             write_complete(client_fd, header, (size_t)h);
             write_complete(client_fd, dbv, db_len);
             free(dbv);
+            free(hdr);
+            close(client_fd);
+            return;
         }
         else
         {
-            const char *nf = "HTTP/1.1 404 Not Found\r\n\r\nNot Found";
+            const char *nf = "HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 9\r\n\r\nNot Found";
             write_complete(client_fd, nf, strlen(nf));
+            free(hdr);
+            close(client_fd);
+            return;
         }
-        close(client_fd);
-        return;
     }
-
-    if (strcmp(method, "DELETE") == 0)
+    else if (strcasecmp(method, "DELETE") == 0)
     {
         atomic_fetch_add(&total_deletes, 1);
         db_delete_kv(path);
         cache_delete(path);
-        const char *ok = "HTTP/1.1 200 OK\r\n\r\nDELETED";
+        const char *ok = "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 7\r\n\r\nDELETED";
         write_complete(client_fd, ok, strlen(ok));
+        free(hdr);
         close(client_fd);
         return;
     }
 
+    /* Unknown method */
+    free(hdr);
     close(client_fd);
+    return;
 }
 
 /* worker thread */
 static void *worker_main(void *arg)
 {
+
     (void)arg;
     while (!stop_server)
     {
@@ -586,12 +721,21 @@ static void *worker_main(void *arg)
 /* ---------- main ---------- */
 int main(void)
 {
-    /* install handlers */
+
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = handle_signal;
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+
+    /* allow overriding worker count via env */
+    const char *w_env = getenv("WORKER_THREADS");
+    if (w_env)
+    {
+        int w = atoi(w_env);
+        if (w >= 1 && w <= MAX_THREADS)
+            worker_count = w;
+    }
 
     if (pipe(shutdown_pipe) == -1)
     {
@@ -650,10 +794,11 @@ int main(void)
 
     /* spawn worker threads */
     pthread_t workers[MAX_THREADS];
-    for (int i = 0; i < MAX_THREADS; ++i)
+    for (int i = 0; i < worker_count; ++i)
         pthread_create(&workers[i], NULL, worker_main, NULL);
 
     printf("Listening on port %d\nAccess stats at: http://localhost:%d/__stats\n", SERVER_PORT, SERVER_PORT);
+    printf("[INFO] WORKER_THREADS=%d (max %d)\n", worker_count, MAX_THREADS);
 
     /* main loop uses select so it can be interrupted by shutdown_pipe */
     fd_set rfds;
@@ -696,7 +841,7 @@ int main(void)
     pthread_cond_broadcast(&queue.not_full);
     pthread_mutex_unlock(&queue.lock);
 
-    for (int i = 0; i < MAX_THREADS; ++i)
+    for (int i = 0; i < worker_count; ++i)
         pthread_join(workers[i], NULL);
 
     for (int i = 0; i < db_pool_size; ++i)
