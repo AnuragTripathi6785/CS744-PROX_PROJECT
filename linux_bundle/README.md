@@ -32,8 +32,12 @@ make io-bound-put THREADS=8 CONNECTIONS=200 DURATION=60s
 ```
 
 ## Full experiment sweeps
-- CPU only: `python3 run_cpu_experiment.py`
-- IO PUT only: `python3 run_io_experiment.py`
+- CPU only: `python3 run_experiments.py cpu`
+- IO PUT only: `python3 run_experiments.py io`
 - Both: `python3 run_experiments.py`
 
 Results go to `experiment_results/`. Use `make graphs` to render PNGs.
+
+## Per-workload results/graphs
+- CPU results: `experiment_results/results_cpu.csv` (graph with `python3 generate_graphs.py --results experiment_results/results_cpu.csv`)
+- IO results: `experiment_results/results_io.csv` (graph with `python3 generate_graphs.py --results experiment_results/results_io.csv`)

@@ -18,15 +18,15 @@ from collections import defaultdict
 
 # Configuration
 SERVER_URL = "http://localhost:8080"
-DURATION = 120  # 2 minutes per test (seconds)
+DURATION = 180  # 3 minutes per test (seconds)
 # Explicit (threads, connections) pairs for each run
 LOAD_MATRIX = [
-    (5, 400),
-    (10, 400),
-    (15, 400),
-    (20, 400),
-    (25, 400),
-    (30, 400),
+    (2, 200),
+    (4, 200),
+    (8, 200),
+    (12, 200),
+    (24, 200),
+    (36, 200),
 ]
 OUTPUT_DIR = "experiment_results"
 RESULTS_CSV = os.path.join(OUTPUT_DIR, "results.csv")
@@ -346,25 +346,26 @@ def run_workload_experiments(workload_name, script):
     
     return results
 
-def save_results(all_results):
+def save_results(all_results, csv_path, json_path):
     """Save results to CSV and JSON"""
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     
+    if not all_results:
+        print("[WARN] No results to save.")
+        return
+    
     # Save CSV
-    with open(RESULTS_CSV, 'w', newline='') as f:
-        if not all_results:
-            return
-        
+    with open(csv_path, 'w', newline='') as f:
         fieldnames = list(all_results[0].keys())
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(all_results)
     
     # Save JSON
-    with open(METRICS_JSON, 'w') as f:
+    with open(json_path, 'w') as f:
         json.dump(all_results, f, indent=2)
     
-    print(f"\n[SAVED] Results saved to {RESULTS_CSV} and {METRICS_JSON}")
+    print(f"\n[SAVED] Results saved to {csv_path} and {json_path}")
 
 def main():
     """Main experiment runner"""
@@ -380,6 +381,17 @@ def main():
     )
     args = parser.parse_args()
 
+    # Choose output filenames per workload
+    if args.workload == "cpu":
+        csv_path = os.path.join(OUTPUT_DIR, "results_cpu.csv")
+        json_path = os.path.join(OUTPUT_DIR, "metrics_cpu.json")
+    elif args.workload == "io":
+        csv_path = os.path.join(OUTPUT_DIR, "results_io.csv")
+        json_path = os.path.join(OUTPUT_DIR, "metrics_io.json")
+    else:
+        csv_path = RESULTS_CSV
+        json_path = METRICS_JSON
+
     print("="*60)
     print("CS744 Phase 2: Comprehensive Load Testing")
     print("="*60)
@@ -388,6 +400,7 @@ def main():
     print(f"Load matrix (threads, connections): {LOAD_MATRIX}")
     print(f"Results directory: {OUTPUT_DIR}")
     print(f"Selected workload: {args.workload}")
+    print(f"Results file: {csv_path}")
     print("="*60)
     
     # Check if server is running
@@ -417,7 +430,7 @@ def main():
         all_results.extend(results)
     
     # Save results
-    save_results(all_results)
+    save_results(all_results, csv_path, json_path)
     
     print("\n" + "="*60)
     print("Experiments completed!")

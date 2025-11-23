@@ -9,7 +9,7 @@
 #include <arpa/inet.h>
 #include <sys/select.h>
 #include <sys/socket.h>
-#include <libpq-fe.h>
+#include <postgresql/libpq-fe.h>
 
 #define SERVER_PORT 8080
 #define BUFFER_SIZE 8192
@@ -17,9 +17,10 @@
 #define HASH_SIZE 1031
 #define MAX_THREADS 8
 #define MAX_QUEUE 256
-#define DB_CONNINFO "host=localhost port=5432 dbname=proxydb user=proxyuser password=proxypass"
+#define DB_CONNINFO "host=localhost port=5432 dbname=proxydb user=postgres password=#define DB_CONNINFO " host = localhost port = 5432 dbname = proxydb user = postgres password = proxypass "
+"
 
-typedef struct Cacheline
+    typedef struct Cacheline
 {
     char *key;
     char *value;

@@ -18,15 +18,15 @@ OUTPUT_DIR = "experiment_results"
 RESULTS_CSV = os.path.join(OUTPUT_DIR, "results.csv")
 GRAPHS_DIR = os.path.join(OUTPUT_DIR, "graphs")
 
-def load_results():
+def load_results(results_path):
     """Load results from CSV"""
     results = []
-    if not os.path.exists(RESULTS_CSV):
-        print(f"[ERROR] Results file not found: {RESULTS_CSV}")
+    if not os.path.exists(results_path):
+        print(f"[ERROR] Results file not found: {results_path}")
         print("[ERROR] Please run experiments first: python3 run_experiments.py")
         sys.exit(1)
     
-    with open(RESULTS_CSV, 'r') as f:
+    with open(results_path, 'r') as f:
         reader = csv.DictReader(f)
         for row in reader:
             # Convert numeric fields
@@ -56,19 +56,19 @@ def group_by_workload(results):
     return grouped
 
 def plot_throughput(grouped_results):
-    """Plot throughput vs load level"""
+    """Plot throughput vs thread count"""
     fig, ax = plt.subplots(figsize=(10, 6))
     
     for workload, results in grouped_results.items():
-        connections = [r['connections'] for r in results]
+        x_vals = [r.get('threads', r['connections']) for r in results]
         throughput = [r['throughput'] for r in results]
         
-        ax.plot(connections, throughput, marker='o', linewidth=2, 
+        ax.plot(x_vals, throughput, marker='o', linewidth=2, 
                 markersize=8, label=workload)
     
-    ax.set_xlabel('Load Level (Concurrent Connections)', fontsize=12)
+    ax.set_xlabel('Threads', fontsize=12)
     ax.set_ylabel('Throughput (Requests/sec)', fontsize=12)
-    ax.set_title('Throughput vs Load Level', fontsize=14, fontweight='bold')
+    ax.set_title('Throughput vs Threads', fontsize=14, fontweight='bold')
     ax.grid(True, alpha=0.3)
     ax.legend(fontsize=10)
     ax.set_xlim(left=0)
@@ -80,19 +80,19 @@ def plot_throughput(grouped_results):
     plt.close()
 
 def plot_latency(grouped_results):
-    """Plot latency vs load level"""
+    """Plot latency vs thread count"""
     fig, ax = plt.subplots(figsize=(10, 6))
     
     for workload, results in grouped_results.items():
-        connections = [r['connections'] for r in results]
+        x_vals = [r.get('threads', r['connections']) for r in results]
         latency = [r['latency_mean'] for r in results]
         
-        ax.plot(connections, latency, marker='s', linewidth=2, 
-                markersize=8, label=f"{workload} (Mean)")
+        ax.plot(x_vals, latency, marker='s', linewidth=2, 
+                markersize=8, label=workload)
     
-    ax.set_xlabel('Load Level (Concurrent Connections)', fontsize=12)
+    ax.set_xlabel('Threads', fontsize=12)
     ax.set_ylabel('Latency (ms)', fontsize=12)
-    ax.set_title('Latency vs Load Level', fontsize=14, fontweight='bold')
+    ax.set_title('Latency vs Threads', fontsize=14, fontweight='bold')
     ax.grid(True, alpha=0.3)
     ax.legend(fontsize=10)
     ax.set_xlim(left=0)
@@ -104,19 +104,19 @@ def plot_latency(grouped_results):
     plt.close()
 
 def plot_cpu_utilization(grouped_results):
-    """Plot CPU utilization vs load level"""
+    """Plot CPU utilization vs thread count"""
     fig, ax = plt.subplots(figsize=(10, 6))
     
     for workload, results in grouped_results.items():
-        connections = [r['connections'] for r in results]
+        x_vals = [r.get('threads', r['connections']) for r in results]
         cpu = [r.get('avg_cpu_percent', 0) for r in results]
         
-        ax.plot(connections, cpu, marker='^', linewidth=2, 
+        ax.plot(x_vals, cpu, marker='^', linewidth=2, 
                 markersize=8, label=workload)
     
-    ax.set_xlabel('Load Level (Concurrent Connections)', fontsize=12)
+    ax.set_xlabel('Threads', fontsize=12)
     ax.set_ylabel('CPU Utilization (%)', fontsize=12)
-    ax.set_title('CPU Utilization vs Load Level', fontsize=14, fontweight='bold')
+    ax.set_title('CPU Utilization vs Threads', fontsize=14, fontweight='bold')
     ax.grid(True, alpha=0.3)
     ax.legend(fontsize=10)
     ax.set_xlim(left=0)
@@ -226,6 +226,12 @@ def plot_combined_workload(workload_name, results):
 
 def main():
     """Generate all graphs"""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Generate graphs from experiment results")
+    parser.add_argument("--results", default=RESULTS_CSV, help="Path to results CSV (default: experiment_results/results.csv)")
+    args = parser.parse_args()
+
     print("="*60)
     print("Generating Graphs from Experiment Results")
     print("="*60)
@@ -234,7 +240,7 @@ def main():
     os.makedirs(GRAPHS_DIR, exist_ok=True)
     
     # Load results
-    results = load_results()
+    results = load_results(args.results)
     if not results:
         print("[ERROR] No results found")
         sys.exit(1)
@@ -270,4 +276,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
