@@ -5,7 +5,7 @@
 counter = 0
 math.randomseed(os.time())
 
-local payload_len = 512
+local payload_len = 1024
 
 local function random_payload()
     local t = {}

@@ -32,11 +32,11 @@ static Cacheline *lru_head = NULL, *lru_tail = NULL;
 static Cacheline *hash_table[HASH_SIZE] = {0};
 static int current_cache_count = 0;
 static pthread_rwlock_t cache_rwlock = PTHREAD_RWLOCK_INITIALIZER;
-static int worker_count = MAX_THREADS;
 /* statistics */
 static atomic_ulong cache_hit = 0, cache_miss = 0;
 static atomic_ulong db_reads = 0, db_writes = 0;
 static atomic_ulong total_gets = 0, total_puts = 0, total_deletes = 0;
+static const char *db_conninfo_str = DB_CONNINFO;
 
 /* DB pool */
 // perthread db connection
@@ -99,7 +99,7 @@ static int init_db_pool(void)
 {
     for (int i = 0; i < db_pool_size; ++i)
     {
-        db_conn_pool[i] = PQconnectdb(DB_CONNINFO);
+        db_conn_pool[i] = PQconnectdb(db_conninfo_str);
         if (PQstatus(db_conn_pool[i]) != CONNECTION_OK)
         {
             fprintf(stderr, "DB connection %d failed: %s\n", i, PQerrorMessage(db_conn_pool[i]));
@@ -431,7 +431,7 @@ static void handle_client_fd(int client_fd)
 {
     if (!thread_conn)
     {
-        thread_conn = PQconnectdb(DB_CONNINFO);
+        thread_conn = PQconnectdb(db_conninfo_str);
         if (PQstatus(thread_conn) != CONNECTION_OK)
         {
             fprintf(stderr, "Thread DB connection failed: %s\n", PQerrorMessage(thread_conn));
@@ -728,15 +728,6 @@ int main(void)
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
-    /* allow overriding worker count via env */
-    const char *w_env = getenv("WORKER_THREADS");
-    if (w_env)
-    {
-        int w = atoi(w_env);
-        if (w >= 1 && w <= MAX_THREADS)
-            worker_count = w;
-    }
-
     if (pipe(shutdown_pipe) == -1)
     {
         perror("pipe");
@@ -770,6 +761,11 @@ int main(void)
     addr.sin_port = htons(SERVER_PORT);
     addr.sin_addr.s_addr = INADDR_ANY;
 
+    /* allow DB_CONNINFO override via environment (e.g., DB_CONNINFO="host=localhost dbname=proxydb user=postgres password=postgres") */
+    const char *env_conn = getenv("DB_CONNINFO");
+    if (env_conn && *env_conn)
+        db_conninfo_str = env_conn;
+
     if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
     {
         if (errno == EADDRINUSE)
@@ -794,11 +790,10 @@ int main(void)
 
     /* spawn worker threads */
     pthread_t workers[MAX_THREADS];
-    for (int i = 0; i < worker_count; ++i)
+    for (int i = 0; i < MAX_THREADS; ++i)
         pthread_create(&workers[i], NULL, worker_main, NULL);
 
     printf("Listening on port %d\nAccess stats at: http://localhost:%d/__stats\n", SERVER_PORT, SERVER_PORT);
-    printf("[INFO] WORKER_THREADS=%d (max %d)\n", worker_count, MAX_THREADS);
 
     /* main loop uses select so it can be interrupted by shutdown_pipe */
     fd_set rfds;
@@ -841,7 +836,7 @@ int main(void)
     pthread_cond_broadcast(&queue.not_full);
     pthread_mutex_unlock(&queue.lock);
 
-    for (int i = 0; i < worker_count; ++i)
+    for (int i = 0; i < MAX_THREADS; ++i)
         pthread_join(workers[i], NULL);
 
     for (int i = 0; i < db_pool_size; ++i)
