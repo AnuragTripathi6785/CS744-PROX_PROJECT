@@ -9,16 +9,15 @@
 #include <arpa/inet.h>
 #include <sys/select.h>
 #include <sys/socket.h>
-#include <postgresql/libpq-fe.h>
+#include <libpq-fe.h>
 
 #define SERVER_PORT 8080
 #define BUFFER_SIZE 8192
-#define CACHE_CAPACITY 200
+#define CACHE_CAPACITY 1000
 #define HASH_SIZE 1031
-#define MAX_THREADS 8
-#define MAX_QUEUE 256
-#define DB_CONNINFO "host=localhost port=5432 dbname=proxydb user=postgres password=#define DB_CONNINFO " host = localhost port = 5432 dbname = proxydb user = postgres password = proxypass "
-"
+#define MAX_THREADS 128
+#define MAX_QUEUE 8192
+#define DB_CONNINFO "host=localhost port=5432 dbname=proxydb user=proxyuser password=proxypass"
 
     typedef struct Cacheline
 {
@@ -38,6 +37,8 @@ static atomic_ulong cache_hit = 0, cache_miss = 0;
 static atomic_ulong db_reads = 0, db_writes = 0;
 static atomic_ulong total_gets = 0, total_puts = 0, total_deletes = 0;
 static const char *db_conninfo_str = DB_CONNINFO;
+static int putall_in_memory = 0; /* optional fast path to skip DB writes for putall_* keys */
+static int get_cpu_burn_iters = 0; /* optional busy-loop iterations for GETs (CPU-bound tests) */
 
 /* DB pool */
 // perthread db connection
@@ -46,6 +47,29 @@ static PGconn *db_conn_pool[10];
 static int db_pool_size = 10;
 static pthread_mutex_t db_pool_lock = PTHREAD_MUTEX_INITIALIZER;
 static int pool_index = 0;
+
+static int ensure_thread_db_conn(void)
+{
+    if (!thread_conn)
+    {
+        thread_conn = PQconnectdb(db_conninfo_str);
+        if (PQstatus(thread_conn) != CONNECTION_OK)
+        {
+            fprintf(stderr, "Thread DB connection failed: %s\n", PQerrorMessage(thread_conn));
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* optional CPU burn to simulate CPU-bound GET path */
+static inline void burn_cycles(int iters)
+{
+    volatile int x = 0;
+    for (int i = 0; i < iters; i++)
+        x += i;
+    (void)x;
+}
 
 /* task queue */
 typedef struct
@@ -430,17 +454,6 @@ static int dequeue_task(void)
 /* Robust client handler: reads headers fully, parses Content-Length, reads body reliably. */
 static void handle_client_fd(int client_fd)
 {
-    if (!thread_conn)
-    {
-        thread_conn = PQconnectdb(db_conninfo_str);
-        if (PQstatus(thread_conn) != CONNECTION_OK)
-        {
-            fprintf(stderr, "Thread DB connection failed: %s\n", PQerrorMessage(thread_conn));
-            close(client_fd);
-            return;
-        }
-    }
-
     /* Read headers (loop until "\r\n\r\n") into a dynamically grown buffer */
     size_t hdr_cap = 8192;
     size_t hdr_len = 0;
@@ -626,8 +639,20 @@ static void handle_client_fd(int client_fd)
         /* Null-terminate for safety in case code expects strings (values may be binary) */
         body_buf[content_length] = '\0';
 
-        /* Write to DB and update cache */
-        if (db_write_kv(path, body_buf, (size_t)content_length) == 0)
+        int skip_db = putall_in_memory && strncmp(path, "/putall_", 8) == 0;
+        if (!skip_db && ensure_thread_db_conn() != 0)
+        {
+            const char *err = "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+            write_complete(client_fd, err, strlen(err));
+            free(body_buf);
+            free(hdr);
+            close(client_fd);
+            return;
+        }
+
+        /* Write to DB (unless skipped) and update cache */
+        int db_ok = skip_db ? 1 : (db_write_kv(path, body_buf, (size_t)content_length) == 0);
+        if (db_ok)
         {
             cache_write(path, body_buf, (size_t)content_length);
             const char *ok = "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nOK";
@@ -652,21 +677,34 @@ static void handle_client_fd(int client_fd)
         char *val = cache_read(path, &len);
         if (val)
         {
-            atomic_fetch_add(&cache_hit, 1);
-            char header[160];
-            int h = snprintf(header, sizeof(header), "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: %zu\r\n\r\n", len);
-            write_complete(client_fd, header, (size_t)h);
-            write_complete(client_fd, val, len);
-            free(hdr);
+        atomic_fetch_add(&cache_hit, 1);
+        if (get_cpu_burn_iters > 0)
+            burn_cycles(get_cpu_burn_iters);
+        /* burn CPU to simulate work on hot cache hits */
+        char header[160];
+        int h = snprintf(header, sizeof(header), "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: %zu\r\n\r\n", len);
+        write_complete(client_fd, header, (size_t)h);
+        write_complete(client_fd, val, len);
+        free(hdr);
             close(client_fd);
             return;
         }
 
         atomic_fetch_add(&cache_miss, 1);
         size_t db_len = 0;
+        if (ensure_thread_db_conn() != 0)
+        {
+            const char *err = "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+            write_complete(client_fd, err, strlen(err));
+            free(hdr);
+            close(client_fd);
+            return;
+        }
         char *dbv = db_read_kv(path, &db_len);
         if (dbv)
         {
+            if (get_cpu_burn_iters > 0)
+                burn_cycles(get_cpu_burn_iters);
             cache_write(path, dbv, db_len);
             char header[160];
             int h = snprintf(header, sizeof(header), "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: %zu\r\n\r\n", db_len);
@@ -689,6 +727,14 @@ static void handle_client_fd(int client_fd)
     else if (strcasecmp(method, "DELETE") == 0)
     {
         atomic_fetch_add(&total_deletes, 1);
+        if (ensure_thread_db_conn() != 0)
+        {
+            const char *err = "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+            write_complete(client_fd, err, strlen(err));
+            free(hdr);
+            close(client_fd);
+            return;
+        }
         db_delete_kv(path);
         cache_delete(path);
         const char *ok = "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 7\r\n\r\nDELETED";
@@ -728,6 +774,22 @@ int main(void)
     sa.sa_handler = handle_signal;
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+
+    const char *fast_put = getenv("PUTALL_IN_MEMORY");
+    if (fast_put && (strcasecmp(fast_put, "1") == 0 || strcasecmp(fast_put, "true") == 0 || strcasecmp(fast_put, "yes") == 0))
+    {
+        putall_in_memory = 1;
+        printf("[INFO] PUTALL_IN_MEMORY enabled: putall_* keys will skip DB writes (cache only).\n");
+    }
+    const char *burn_env = getenv("GET_CPU_BURN_ITERS");
+    if (burn_env && *burn_env)
+    {
+        get_cpu_burn_iters = atoi(burn_env);
+        if (get_cpu_burn_iters < 0)
+            get_cpu_burn_iters = 0;
+        if (get_cpu_burn_iters > 0)
+            printf("[INFO] GET_CPU_BURN_ITERS=%d (burn cycles per GET for CPU-bound tests)\n", get_cpu_burn_iters);
+    }
 
     if (pipe(shutdown_pipe) == -1)
     {
